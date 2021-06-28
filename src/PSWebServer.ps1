@@ -6,41 +6,43 @@ $VerbosePreference = "continue"
 
 $thisWebServer = New-PSWebServer
 
-Get "/help/{ID}" -ScriptBlock {
+Function myTest {
+    return "TOMATO"
+}
+
+New-PSWebServerMiddlewareController -Name "AddContent" -Order "Before" -ScriptBlock {
     param (
-		$Body,
+        $Response
+    )
+
+    $Response.Headers.Add("tomato", "potato")
+}
+
+Get "/help/{ID}" -WebServer $thisWebServer -ScriptBlock {
+    param (
         [FromBody()]
 		[string]$Name,
         [FromRoute()]
         [int32]$ID
     )
 	
-    write-host "Request Body: $Body"
     write-host "ID from Route: $ID"
     write-host "Name from Body: $Name"
-    write-output "help"
-}
+    write-output (myTest)
+} 
+
+
+Get "/assets" -WebServer $thisWebServer -ScriptBlock {
+    param ()
+	
+    write-output @(
+        @{
+            "tomato" = "potato"
+        }
+        @{
+            "potato" = "potato"
+        }
+    )
+} 
 
 $thisWebServer.HandleOneRequest()
-
-<#
-Register-PSWebServerController -Name "HelpController" -Code {
-    param (
-		$Body,
-        [FromBody()]
-		$Name
-    )
-    write-host "Request Body: $Body"
-    write-host "Name from Body: $Name"
-    write-output "help"
-}
-
-Register-PSWebServerRoute -Method "Get" -Route "/help*" -ControllerName "HelpController"
-
-Start-PSWebServer -Binding "http://*:8080/"
-
-while ($true) {
-    Wait-PSWebServerRequest
-    start-sleep -seconds 1
-}#>
-
