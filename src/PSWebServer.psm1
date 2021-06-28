@@ -45,10 +45,13 @@ class WebServer {
 		while (-not $contextTask.AsyncWaitHandle.WaitOne(10)) {
 			# Do nothing
 		}
+		$Duration = measure-command {
+			$this.RequestHandler.HandleRequest( $ContextTask.GetAwaiter().GetResult() )
+		}
+		write-verbose "Request took $($Duration) ms"
 		
-		$this.RequestHandler.HandleRequest( $ContextTask.GetAwaiter().GetResult() )
 		
-		if ($wasStartedForThisRequest) { $this.stop() }
+		if ($this.isStarted() -and $WasStartedForThisRequest) { $this.Stop() }
 		# For unit testing it might be useful to return a clone of the context object to the caller of HandleOneRequest
 	}
 	
@@ -103,8 +106,12 @@ class RequestHandler {
 		$this.Routes += $Route
 	}
 	
+	[Route[]] GetRoutesForUri ([string] $Uri) {
+		return $this.Routes.Where{$_.testMatchesUri($uri)}
+	}
+
 	[Controller[]] GetControllersForUri ([string] $uri) {
-		return $this.Routes.Where{$_.testMatchesUri($uri)}.foreach{$_.GetController()}
+		return $this.GetRoutesForUri($uri).foreach{$_.GetController()}
 	}
 	
 	[void] HandleRequest ($Context) {
@@ -115,15 +122,21 @@ class RequestHandler {
 		
 		$Uri = $Request.rawUrl
 		
+		$RelevantRoutes = $this.GetRoutesForUri($Uri)
 		$RelevantControllers = $this.GetControllersForUri($uri)
 		
-		$relevantRequestControllers = $RelevantControllers.Where{$_.type -eq [ControllerTypeEnum]::Request}
-		
+		$RelevantRoutesWithRequestControllers = $RelevantRoutes.Where{$_.Controller.Type -eq [ControllerTypeEnum]::Request}
+
+		if ($RelevantRoutesWithRequestControllers.count -eq 0) { throw "Zero controllers matche route $uri" }
+		if ($RelevantRoutesWithRequestControllers.count -gt 1) { throw "More than one controller matches route $uri" }
+
+		$RelevantRouteWithRequestController = $RelevantRoutesWithRequestControllers[0]
+
 		$RelevantMiddleWareControllers = $RelevantControllers.Where{$_.type -eq [ControllerTypeEnum]::Middleware}
 		$RelevantBeforeMiddlewareControllers = $RelevantMiddleWareControllers.Where{$_.Order -eq [MiddlewareControllerOrderEnum]::Before}
 		$RelevantAfterMiddlewareControllers  = $RelevantMiddleWareControllers.Where{$_.Order -eq [MiddlewareControllerOrderEnum]::After}
 		
-		write-verbose "Request matches $($relevantRequestControllers.count) request controllers"
+		write-verbose "Request matches $($RelevantRouteWithRequestController.Controller.Name) request controllers"
 		write-verbose "Request matches $($RelevantMiddleWareControllers.count) middleware controllers"
 		
 		$RelevantBeforeMiddlewareControllers.Foreach{$_.HandleRequest($context)}
@@ -131,7 +144,7 @@ class RequestHandler {
 		$Body = $null
 		
 		try {
-			$Body = $RelevantRequestControllers.Foreach{$_.HandleRequest($context)}
+			$Body = $RelevantRouteWithRequestController.Controller.HandleRequest($context, $RelevantRouteWithRequestController)
 			$Response.statuscode = 200
 		}
 		catch {
@@ -174,7 +187,9 @@ class Controller {
 		$this.ScriptBlock = $ScriptBlock
 	}
 	
-	HandleRequest ($Context) {
+	HandleRequest ($Context, $Route) {
+		$Uri = $Context.Request.rawUrl
+
 		write-host "Running through $($This.Type) $($This.Name) Controller"
 		
 		function _getRequestBody {
@@ -182,25 +197,29 @@ class Controller {
 			$Length = $Context.Request.contentlength64
 
 			$buffer = [byte[]]::new($Length)
-			[void]$Context.Request.InputStream.read($buffer, 0, $length)
-			write-output [system.text.encoding]::UTF8.getstring($buffer)
+			[void] $Context.Request.InputStream.read($buffer, 0, $length)
+
+			write-output ([system.text.encoding]::UTF8.getstring($buffer))
 
 		}
 		
 		function _getRequestBodyJson {
 			param ($Context)
+
 			$RequestBody = _getRequestBody -Context $context
 			
 			write-output (ConvertFrom-Json -AsHashtable -InputObject $RequestBody)
 		}
 		
+
 		
 		# Look at the AST to find out what params our scriptblock has defined
 		# map fields from the body into the params 
 		$Params = @{}
+		$RouteParams = $Route.getParamsFromRoute($Uri)
 		
 		foreach ($Parameter in $this.ScriptBlock.Ast.ParamBlock.Parameters) {
-			$ParameterName = $Parameter.Name.VariablePath.UserPath.toLower()
+			$ParameterName = $Parameter.Name.VariablePath.UserPath
 			$ParameterAttributes = $Parameter.Attributes
 			
 			Foreach ($ScriptBlockParam in $ParameterAttributes) {
@@ -209,9 +228,13 @@ class Controller {
 					
 					$Params.Add($ParameterName, $thisRequestBody[$ParameterName])
 				}
+				if ($ScriptBlockParam.TypeName.Name -eq "FromRoute") {					
+					$Params.Add($ParameterName, $RouteParams[$ParameterName])
+				}
 			}
 		}
 		
+
 		& $this.ScriptBlock @Params
 	}
 }
@@ -245,11 +268,20 @@ class MiddlewareController : Controller {
 }
 
 class Route {
-	[string] $Match
+	[string] $RegexMatch
+	[string] $QuickMatch
 	[Controller] $Controller
 	
 	Route ([string] $Match, [Controller] $Controller) {
-		$this.match = $Match
+		# Route Interpretation
+		$this.RegexMatch = $null
+		$this.QuickMatch = $Match
+
+		if ($Match -like "*{*") {
+			$this.RegexMatch = $Match -replace ("{(.*?)}",'(?<$1>.*)')
+			$this.QuickMatch = $Match -replace ("{.*?}",'*')
+		}
+
 		$this.Controller = $Controller
 	}
 	
@@ -257,8 +289,18 @@ class Route {
 		return $this.Controller
 	}
 	
+	[hashtable] getParamsFromRoute ( [string] $uri ) {
+		if ($this.RegexMatch -eq $null) { return @{} }
+		if ($uri -match $this.RegexMatch) {
+			$params = $Matches
+			[void] ($params.remove(0))
+			return $Params
+		}
+		return @{}
+	}
+
 	[bool] testMatchesUri ([string] $uri) {
-		if ($uri -like $this.Match) {
+		if ($uri -like $this.QuickMatch) {
 			return $true
 		}
 		return $false
@@ -288,6 +330,7 @@ Function New-PSWebServerMiddlewareController {
 		$ScriptBlock,
 		$Order
 	)
+	
 	return [MiddlewareController]::New($Name,$ScriptBlock, $Order)
 }
 
