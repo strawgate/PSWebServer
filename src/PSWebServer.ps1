@@ -18,6 +18,43 @@ New-PSWebServerMiddlewareController -Name "AddContent" -Order "Before" -ScriptBl
     $Response.Headers.Add("tomato", "potato")
 }
 
+
+Middleware -Name "ConvertRequestToRequestType" -Before -Match "*" -ScriptBlock {
+    param (
+        $Request
+    )
+
+    if (-not $Request.TryGetHeader("content-type")) { return }
+
+    $ContentTypeHeader = $Request.GetHeader("content-type")
+
+    if ([string]::IsNullOrWhiteSpace($Request.GetBody())) { return }
+
+    switch ($ContentTypeHeader.Value) {
+        "application/json" {
+            $Request.SetBody((ConvertTo-Json -InputObject $Request.GetBody()))
+        }
+    }
+}
+
+Middleware -Name "ConvertResponseToContentType" -After -Match "*" -ScriptBlock {
+    param (
+        $Request,
+        $Response
+    )
+
+    if (-not $Request.TryGetHeader("content-type")) { return }
+
+    $ContentTypeHeader = $Request.GetHeader("content-type")
+    if ([string]::IsNullOrWhiteSpace($Response.GetBody())) { return }
+
+    switch ($ContentTypeHeader.Value) {
+        "application/json" {
+            $Response.SetBody((ConvertTo-Json -InputObject $Response.GetBody()))
+        }
+    }
+}
+
 Get "/help/{ID}" -WebServer $thisWebServer -ScriptBlock {
     param (
         [FromBody()]

@@ -4,13 +4,20 @@ $VerbosePreference = "continue"
 
 $Script:DefaultWebServer = $null
 
-class FromBodyAttribute : Attribute 
-{
-    FromBodyAttribute() {}
+class FromBodyAttribute : Attribute {
+	FromBodyAttribute() {}
 }
-class FromRouteAttribute : Attribute 
-{
-    FromRouteAttribute() {}
+class FromRouteAttribute : Attribute {
+	FromRouteAttribute() {}
+}
+
+class Request {
+
+}
+
+class Response {
+	[object] $Body
+	[int] $StatusCode
 }
 
 
@@ -45,10 +52,10 @@ class WebServer {
 		while (-not $contextTask.AsyncWaitHandle.WaitOne(10)) {
 			# Do nothing
 		}
-		$Duration = measure-command {
+		#$Duration = measure-command {
 			$this.RequestHandler.HandleRequest( $ContextTask.GetAwaiter().GetResult() )
-		}
-		write-verbose "Request took $($Duration.TotalMilliseconds) ms"
+		#}
+		#write-verbose "Request took $($Duration.TotalMilliseconds) ms"
 		
 		
 		if ($this.isStarted() -and $WasStartedForThisRequest) { $this.Stop() }
@@ -129,85 +136,58 @@ class RequestHandler {
 	}
 	
 	[Route[]] GetRoutesForUri ([string] $Uri) {
-		return $this.Routes.Where{$_.testMatchesUri($uri)}
+		return $this.Routes.Where{ $_.testMatchesUri($uri) }
+
 	}
 
+	[Route[]] GetOrderedRoutesForUri ([string] $Uri) {
+		[Route[]] $AllRoutes = $this.GetRoutesForUri($uri)
+
+		[Route[]] $OrderedRoutes = @(
+			$AllRoutes.Where{ $_.GetController().Type -eq [ControllerTypeEnum]::Middleware -and $_.GetController().Order -eq [MiddlewareControllerOrderEnum]::Before }
+			$AllRoutes.Where{ $_.GetController().Type -eq [ControllerTypeEnum]::Request }
+			$AllRoutes.Where{ $_.GetController().Type -eq [ControllerTypeEnum]::Middleware -and $_.GetController().Order -eq [MiddlewareControllerOrderEnum]::After }
+		)
+		return $OrderedRoutes
+	}
+
+
 	[Controller[]] GetControllersForUri ([string] $uri) {
-		return $this.GetRoutesForUri($uri).foreach{$_.GetController()}
+		return $this.GetRoutesForUri($uri).foreach{ $_.GetController() }
 	}
 	
 	[void] HandleRequest ($Context) {
 		$Request = [PSWebServerRequest]::new($Context)
-		$Response = $Context.Response
+		$Response = [PSWebServerResponse]::new($Context)
 		
 		write-verbose "$(ConvertTo-Json -Compress -InputObject $Request)"
 		
-		$Uri = $Request.Uri
-		
-		$RelevantRoutes = $this.GetRoutesForUri($Uri)
-		$RelevantControllers = $this.GetControllersForUri($uri)
-		
-		$RelevantRoutesWithRequestControllers = $RelevantRoutes.Where{$_.Controller.Type -eq [ControllerTypeEnum]::Request}
+		$RelevantRoutes = $this.GetOrderedRoutesForUri($Request.Uri)
 
-		if ($RelevantRoutesWithRequestControllers.count -eq 0) { throw "Zero controllers matche route $uri" }
-		if ($RelevantRoutesWithRequestControllers.count -gt 1) { throw "More than one controller matches route $uri" }
+		foreach ($Route in $RelevantRoutes) {
+			$thisController = $Route.GetController()
 
-		$RelevantRouteWithRequestController = $RelevantRoutesWithRequestControllers[0]
+			write-verbose "$($Route.QuickMatch) matches Controller $($thisController.Name)"
 
-		$RelevantMiddleWareControllers = $RelevantControllers.Where{$_.type -eq [ControllerTypeEnum]::Middleware}
-		$RelevantBeforeMiddlewareControllers = $RelevantMiddleWareControllers.Where{$_.Order -eq [MiddlewareControllerOrderEnum]::Before}
-		$RelevantAfterMiddlewareControllers  = $RelevantMiddleWareControllers.Where{$_.Order -eq [MiddlewareControllerOrderEnum]::After}
-		
-		write-verbose "Request matches Request Controller: $($RelevantRouteWithRequestController.Controller.Name) and Middleware Controllers: $($RelevantMiddleWareControllers.Foreach{$_.Name} -join ", ")"
-		
-		$RelevantBeforeMiddlewareControllers.Foreach{$_.HandleRequest($context)}
-		
-		$Body = $null
-		
-		try {
-			$Body = $RelevantRouteWithRequestController.Controller.HandleRequest($context, $RelevantRouteWithRequestController, $this)
-			$Response.statuscode = 200
-		}
-		catch {
-			write-error $_ -erroraction "continue"
-			$Response.statuscode = 500
-		}
-		$RelevantAfterMiddlewareControllers.Foreach{$_.HandleRequest($context)}
-		
-		if ($Body -ne $null -and $Body -is [PSWebServerResponse]) {
-			$Response.statuscode = $Body.StatusCode
-			$buffer = [Text.Encoding]::UTF8.GetBytes($Body.Body)
-			$Response.ContentLength64 = $buffer.length
-			$Response.ContentType = "text/plain; charset=utf-8";
-			$Response.OutputStream.Write($buffer, 0, $buffer.length)
+			$RouteParams = $Route.getParamsFromRoute($Request.Uri)
+
+			$ServiceParams = @{}
+			$this.Services.Foreach{[void] ($ServiceParams.Add($_.Name,$_.Value))}
+
+			$Result = $ThisController.HandleRequest($RouteParams, $ServiceParams, $Request, $Response)
+
+			if ($Response.Body -eq $Null -and $Result -ne $null) { $Response.Body = $Result }
 		}
 
-		# Controller wants us to return a body
-		elseif ($Body -ne $Null -and $Body -is [string]) {
-				
-			$buffer = [Text.Encoding]::UTF8.GetBytes($Body)
-			$Response.ContentLength64 = $buffer.length
-			$Response.ContentType = "text/plain; charset=utf-8";
-			$Response.OutputStream.Write($buffer, 0, $buffer.length)
-		}
-
-		elseif ($Body -ne $Null) {
-				
-			$buffer = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $Body -depth 10))
-			$Response.ContentLength64 = $buffer.length
-			$Response.ContentType = "application/json; charset=utf-8";
-			$Response.OutputStream.Write($buffer, 0, $buffer.length)
-		}
-		
-		# Close the request
-		$Response.Close()
+		$Response.WriteAndClose()
 	}
 }
-class Header {
+
+class PSWebServerHeader {
 	[string] $Name
 	[string] $Value
 
-	Header ([string] $Name, [string] $Value) {
+	PSWebServerHeader ([string] $Name, [string] $Value) {
 		$this.Name = $Name
 		$this.Value = $Value
 	}
@@ -218,25 +198,70 @@ class StatusCodeEnum {
 	$NotFound = 404
 }
 
-class PSWebServerRequest {
-	[string] $Body
-	[header[]] $Headers = @()
+class PSWebServerRequestResponseBase {
+	$Body
+	[PSWebServerHeader[]] $Headers = @()
+	$Context
+
+	PSWebServerRequestResponseBase () {}
+
+	PSWebServerRequestResponseBase ($Context){
+
+		$ThisRequest = $Context.Request
+
+		foreach ($HeaderName in $ThisRequest.Headers) {
+			$this.Headers += [PSWebServerHeader]::New($HeaderName, $ThisRequest.Headers.Get($HeaderName))
+		}
+
+		$this.Context = $Context
+	}
+
+	[bool]   TryGetBody() { return ($This.Body -ne $null) }
+	[object] GetBody() { return $This.Body }
+	[void]   SetBody($Body) { $This.Body = $Body }
+
+
+	[PSWebServerHeader[]] GetHeaders() { return $This.Headers }
+	[PSWebServerHeader] GetHeader([string] $Name) { return $This.Headers.Where{ $_.Name -eq $Name }[0] }
+
+	[bool] TryGetHeader([string] $Name) {
+		try {
+			$this.GetHeader($Name)
+			return $True
+		}
+		catch {
+			return $False
+		}
+	}
+
+	[void]  SetHeaders([PSWebServerHeader[]] $Headers) { $This.Headers = $Headers }
+
+	[void]  AddHeader([PSWebServerHeader] $Header) { $This.Headers += $Header }
+	[void]  RemoveHeader([PSWebServerHeader] $Header) { $This.Headers = $This.Headers.GetHeaders().Where{ $_.Name -eq $Header.Name } }
+	[void]  RemoveHeader([string] $Name) { $This.Headers = $This.Headers.GetHeaders().Where{ $_.Name -eq $Name } }
+
+}
+
+class PSWebServerTransaction { 
+
+}
+
+class PSWebServerRequest : PSWebServerRequestResponseBase {
 	[string] $Uri
 
 	PSWebServerRequest () {}
 
-	PSWebServerRequest ($Context) {
+	PSWebServerRequest ($Context) : base($Context) {
 		$thisRequest = $context.Request
+
+		# Pull the Body from the context into this request
 
 		$Length = $thisRequest.contentlength64
 
-		$buffer = [byte[]]::new($Length)
-		[void] $thisRequest.InputStream.read($buffer, 0, $length)
-
-		$this.Body = ([system.text.encoding]::UTF8.getstring($buffer))
-	
-		foreach ($HeaderName in $ThisRequest.Headers) {
-			$this.Headers += [Header]::New($HeaderName,$ThisRequest.Headers.Get($HeaderName))
+		if ($Length -ne 0) {
+			$buffer = [byte[]]::new($Length)
+			[void] $thisRequest.InputStream.read($buffer, 0, $length)
+			$this.Body = ([system.text.encoding]::UTF8.getstring($buffer))
 		}
 
 		$this.Uri = $thisRequest.rawUrl
@@ -244,29 +269,52 @@ class PSWebServerRequest {
 
 }
 
-class PSWebServerResponse {
+
+class PSWebServerResponse : PSWebServerRequestResponseBase {
 	[int32] $StatusCode
-	[Object] $Body
 
 	PSWebServerResponse () {}
 
-	PSWebServerResponse ($Body, $StatusCode) {
-		$this.Body = $Body
-		$this.StatusCode = $StatusCode
+	PSWebServerResponse ($Context) : base($Context) {}
+	
+	[int32] GetStatusCode() { return $This.StatusCode }
+	[void]  SetStatusCode([int32] $StatusCode) { $This.StatusCode = $StatusCode }
+	
+	[void] Close () {
+		$this.Context.Response.Close()
 	}
 
+	[void] Write() {
+		$buffer = [Text.Encoding]::UTF8.GetBytes($this.Body)
+		$This.Context.Response.ContentLength64 = $buffer.length
+		$This.Context.Response.OutputStream.Write($buffer, 0, $buffer.length)
+	}
+
+	[void] WriteAndClose() {
+		$this.Write()
+		$this.Close()
+	}
+	
 	static [PSWebServerResponse] OK ($Body) {
 		Return [PSWebServerResponse]::new($Body, 200)
 	}
+
+	static [PSWebServerResponse] NOTFOUND ($Body) {
+		Return [PSWebServerResponse]::new($Body, 404)
+	}
+
+	static [PSWebServerResponse] INTERNALSERVERERROR ($Body) {
+		Return [PSWebServerResponse]::new($Body, 500)
+	}
 }
 
-class ControllerTypeEnum {
-	static [string] $Middleware = "Middleware"
-	static [string] $Request = "Request"
+Enum ControllerTypeEnum {
+	Middleware
+	Request
 }
-class MiddlewareControllerOrderEnum {
-	static [string] $Before = "Before"
-	static [string] $After = "After"
+Enum MiddlewareControllerOrderEnum {
+	Before
+	After
 }
 
 class Controller {
@@ -281,63 +329,76 @@ class Controller {
 		$this.ScriptBlock = $ScriptBlock
 	}
 	
-	[object] HandleRequest ($Context, [route] $Route, [requesthandler] $RequestHandler) {
-		$Uri = $Context.Request.rawUrl
 
-		write-host "Running through $($This.Type) $($This.Name) Controller"
-		
-		function _getRequestBody {
-			param ($Context)
-			$Length = $Context.Request.contentlength64
-
-			$buffer = [byte[]]::new($Length)
-			[void] $Context.Request.InputStream.read($buffer, 0, $length)
-
-			write-output ([system.text.encoding]::UTF8.getstring($buffer))
-
-		}
-		
-		function _getRequestBodyJson {
-			param ($Context)
-
-			$RequestBody = _getRequestBody -Context $context
-			
-			write-output (ConvertFrom-Json -AsHashtable -InputObject $RequestBody)
-		}
-		
-
-		
-		# Look at the AST to find out what params our scriptblock has defined
-		# map fields from the body into the params 
-		$Params = @{}
-
-		$RouteParams = $Route.getParamsFromRoute($Uri)
-		
-		foreach ($Service in $RequestHandler.Services) {
-			[Service] $Service = $Service
-			$Params.Add($Service.Name, $service.Value )
-		}
-
-		# Process the params in the param block and provide them from the route or body if they are available
+	[hashtable] GetParamsFromScriptBlock() {
+		$Hashtable = @{}
 		if ($this.ScriptBlock.Ast.ParamBlock -ne $Null) {
 			foreach ($Parameter in $this.ScriptBlock.Ast.ParamBlock.Parameters) {
 				$ParameterName = $Parameter.Name.VariablePath.UserPath
-				$ParameterAttributes = $Parameter.Attributes
-				
-				Foreach ($ScriptBlockParam in $ParameterAttributes) {
-					if ($ScriptBlockParam.TypeName.Name -eq "FromBody") {
-						$thisRequestBody = _getRequestBodyJson -Context $Context
-						
-						$Params.Add($ParameterName, $thisRequestBody[$ParameterName])
-					}
-					if ($ScriptBlockParam.TypeName.Name -eq "FromRoute") {					
-						$Params.Add($ParameterName, [System.Web.HttpUtility]::UrlDecode($RouteParams[$ParameterName]))
-					}
-				}
+
+				$ParameterType = $Parameter.Attributes.Where{$_.TypeName.Name -eq "FromBody" -or $_.TypeName.Name -eq "FromRoute"}
+
+				$Hashtable.Add($ParameterName, $ParameterType)
+			}
+		}
+		return $Hashtable
+	}
+
+	[string[]] GetRouteParamsFromScriptBlock() {
+		[string[]] $returnList = @()
+		
+		foreach ($ParamKV in $this.GetParamsFromScriptBlock().GetEnumerator()) {
+			$ParamName = $ParamKV.Name
+			$ParamType = $ParamKV.Value
+
+			if ($ParamType -eq "FromRoute") {
+				$returnList += $ParamName
+			}
+		} 
+
+		return $ReturnList
+	}
+
+	[string[]] GetBodyParamsFromScriptBlock() {
+		[string[]] $returnList = @()
+		
+		foreach ($ParamKV in $this.GetParamsFromScriptBlock().GetEnumerator()) {
+			$ParamName = $ParamKV.Name
+			$ParamType = $ParamKV.Value
+
+			if ($ParamType -eq "FromBody") {
+				$returnList += $ParamName
+			}
+		} 
+
+		return $ReturnList
+	}
+
+	[object] HandleRequest ([hashtable] $ServiceParams, [hashtable] $RouteParams, [PSWebServerRequest] $Request, [PSWebServerResponse] $Response) {
+		write-host "Running through $($This.Type) $($This.Name) Controller"
+		
+		# Look at the AST to find out what params our scriptblock has defined
+		# map fields from the body into the params 
+		$Params = @{
+			"Request" = $Request
+			"Response" = $Response
+		}
+		$Params += $ServiceParams
+
+		foreach ($FromBodyParamName in $this.GetBodyParamsFromScriptBlock()) {
+			if ($Request.Body -is [hashtable]) {
+				$Params.Add($FromBodyParamName, $Request.Body[$FromBodyParamName])
+			} else {
+				write-warning "A parameter ($FromBodyParamName) was requested from the body, but the body is not a readable object."
 			}
 		}
 		
-
+		foreach ($FromRouteParamName in $this.GetRouteParamsFromScriptBlock()) {
+			if ($RouteParams.ContainsKey($FromRouteParamName)) {
+				$Params.Add($FromRouteParamName, [System.Web.HttpUtility]::UrlDecode($RouteParams[$FromRouteParamName]))
+			}
+		}
+	
 		$Result = & $this.ScriptBlock @Params
 
 		return $result
@@ -350,7 +411,7 @@ class RequestController : Controller {
 		
 	RequestController () {}
 	
-	RequestController ([string] $Name, [scriptBlock] $ScriptBlock) {
+	RequestController ([string] $Name, [scriptBlock] $ScriptBlock)  : Base($Name, $ScriptBlock) {
 		$this.Name = $Name
 		$this.ScriptBlock = $ScriptBlock
 	}
@@ -364,7 +425,7 @@ class MiddlewareController : Controller {
 	
 	MiddlewareController () {}
 	
-	MiddlewareController ([string] $Name, [scriptBlock] $ScriptBlock, [string] $Order) {
+	MiddlewareController ([string] $Name, [scriptBlock] $ScriptBlock, [string] $Order) : Base($Name, $ScriptBlock) {
 		$this.Name = $Name
 		$this.ScriptBlock = $ScriptBlock
 		$this.Order = $Order
@@ -383,8 +444,8 @@ class Route {
 		$this.QuickMatch = $Match
 
 		if ($Match -like "*{*") {
-			$this.RegexMatch = $Match -replace ("{(.*?)}",'(?<$1>.*)')
-			$this.QuickMatch = $Match -replace ("{.*?}",'*')
+			$this.RegexMatch = $Match -replace ("{(.*?)}", '(?<$1>.*)')
+			$this.QuickMatch = $Match -replace ("{.*?}", '*')
 		}
 
 		$this.Controller = $Controller
@@ -422,33 +483,38 @@ class Route {
 
 Function New-PSWebserver {
 	param (
-		$Binding = "http://*:8080/",
+		$Binding = "http://localhost:8080/",
 		$IsDefault = $true
 	)
 
-	return [WebServer]::new($Binding,$IsDefault)
+	return [WebServer]::new($Binding, $IsDefault)
 }
 
 Function New-PSWebServerMiddlewareController {
 	param (
-		$Name,
-		$ScriptBlock,
+		[string] $Name,
+		[scriptblock] $ScriptBlock,
 		$Order,
 		$WebServer = $Script:DefaultWebServer
 	)
-	$thisController = [MiddlewareController]::New($Name,$ScriptBlock, $Order)
 
-	if ($WebServer) { $WebServer.RequestHandler.AddMiddlewareController($thisController)}
-	else {return $thisController}
+	$thisController = [MiddlewareController]::New($Name, $ScriptBlock, $Order)
+
+	if ($WebServer) { $WebServer.RequestHandler.AddMiddlewareController($thisController); return $thisController }
+	else { return $thisController }
 }
 
 Function New-PSWebServerRequestController {
 	param (
 		$Name,
-		$ScriptBlock
+		$ScriptBlock,
+		$WebServer = $Script:DefaultWebServer
 	)
 	
-	return [RequestController]::New($Name,$ScriptBlock)
+	$thisController = [RequestController]::New($Name, $ScriptBlock)
+	
+	if ($WebServer) { $WebServer.RequestHandler.AddRequestController($thisController); return $thisController }
+	else { return $thisController }
 }
 
 Function New-PSWebServerRoute {
@@ -458,14 +524,14 @@ Function New-PSWebServerRoute {
 		$WebServer = $Script:DefaultWebServer
 	)
 	$thisRoute = [Route]::New($Match, $Controller)
-	if ($WebServer) { $WebServer.RequestHandler.AddRoute($thisRoute)}
+	if ($WebServer) { $WebServer.RequestHandler.AddRoute($thisRoute) }
 
 	else {
 		return $thisRoute
 	}
 }
 
-Function New-PSWebServerRouteWithController {
+Function New-PSWebServerRouteWithRequestController {
 	param (
 		[string] $Match,
 		[ScriptBlock] $ScriptBlock,
@@ -479,4 +545,22 @@ Function New-PSWebServerRouteWithController {
 	New-PSWebServerRoute -Match $Match -Controller $thisController -WebServer $Webserver
 }
 
-Set-Alias -Name Get -Value New-PSWebServerRouteWithController
+Function New-PSWebServerRouteWithMiddlewareController {
+	param (
+		[string] $Match,
+		[ScriptBlock] $ScriptBlock,
+		[string] $Name,
+		[switch] $Before,
+		[switch] $After,
+		$WebServer = $Script:DefaultWebServer
+	)
+	
+	if ([string]::IsNullOrWhiteSpace($Name)) { $Name = $Match }
+	$thisController = New-PSWebServerMiddlewareController -Name $Name -ScriptBlock $ScriptBlock -Order $(if ($Before) {"Before"} elseif ($After) {"After"})
+	
+	New-PSWebServerRoute -Match $Match -Controller $thisController -WebServer $Webserver
+}
+
+Set-Alias -Name Get -Value New-PSWebServerRouteWithRequestController
+
+Set-Alias -Name Middleware -Value New-PSWebServerRouteWithMiddlewareController

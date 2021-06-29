@@ -15,11 +15,18 @@ $Script:Repository = [StudentRepository]::new((Join-Path $PSScriptRoot "..\..\da
 $WebServer.RequestHandler.RegisterService("Repository", $Script:Repository) 
 
 Get "/student" -webserver $thisWebServer {
-	param ($Repository)
+	param (
+		$Repository
+	)
+
 	[PSWebServerResponse]::Ok($Repository.GetStudents())
 }
 
 Get "/student/{FullName}" -webserver $thisWebServer {
-	param ($Repository, [fromroute()][string]$FullName)
+	param (
+		$Repository,
+		[fromroute()]
+		[string]$FullName
+	)
 	write-output $Repository.GetStudent($Fullname)
 }
