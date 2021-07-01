@@ -24,9 +24,9 @@ Middleware -Name "ConvertRequestToRequestType" -Before -Match "*" -ScriptBlock {
         $Request
     )
 
-    if (-not $Request.TryGetHeader("content-type")) { return }
+    if (-not $Request.TryGetHeader("Content-Type")) { return }
 
-    $ContentTypeHeader = $Request.GetHeader("content-type")
+    $ContentTypeHeader = $Request.GetHeader("Content-Type")
 
     if ([string]::IsNullOrWhiteSpace($Request.GetBody())) { return }
 
@@ -43,15 +43,22 @@ Middleware -Name "ConvertResponseToContentType" -After -Match "*" -ScriptBlock {
         $Response
     )
 
-    if (-not $Request.TryGetHeader("content-type")) { return }
+    if (-not $Request.TryGetHeader("Accept")) { return }
 
-    $ContentTypeHeader = $Request.GetHeader("content-type")
+    $AcceptHeader = $Request.GetHeader("Accept")
     if ([string]::IsNullOrWhiteSpace($Response.GetBody())) { return }
-
-    switch ($ContentTypeHeader.Value) {
-        "application/json" {
-            $Response.SetBody((ConvertTo-Json -InputObject $Response.GetBody()))
+	
+    switch ($AcceptHeader.Value) {
+        {$_ -like "*application/json*"} {
+			$AcceptHeader = $Response.AddHeader("Content-Type","application/json; charset=utf-8")
+            $Response.SetBody((ConvertTo-Json -InputObject $Response.GetBody() -depth 10))
         }
+		default {
+            
+			$AcceptHeader = $Response.AddHeader("Content-Type","application/json; charset=utf-8")
+            $Response.SetBody((ConvertTo-Json -InputObject $Response.GetBody() -depth 10))
+			
+		}
     }
 }
 
@@ -68,6 +75,9 @@ Get "/help/{ID}" -WebServer $thisWebServer -ScriptBlock {
     write-output (myTest)
 } 
 
+GET "/large.json" -WebServer $thisWebServer  -ScriptBlock {
+	return (ConvertFrom-Json (Get-Content -Raw -Path (join-path $PSSCriptRoot "largeDict.json")) -ashashtable -depth 10)
+}
 
 Get "/assets" -WebServer $thisWebServer -ScriptBlock {
     param ()
@@ -82,4 +92,4 @@ Get "/assets" -WebServer $thisWebServer -ScriptBlock {
     )
 } 
 
-$thisWebServer.HandleOneRequest()
+$thisWebServer.HandleRequests()

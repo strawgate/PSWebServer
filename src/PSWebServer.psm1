@@ -10,6 +10,9 @@ class FromBodyAttribute : Attribute {
 class FromRouteAttribute : Attribute {
 	FromRouteAttribute() {}
 }
+class FromDependencyAttribute : Attribute {
+	FromDependencyAttribute() {}
+}
 
 class Request {
 
@@ -237,6 +240,7 @@ class PSWebServerRequestResponseBase {
 	[void]  SetHeaders([PSWebServerHeader[]] $Headers) { $This.Headers = $Headers }
 
 	[void]  AddHeader([PSWebServerHeader] $Header) { $This.Headers += $Header }
+	[void]  AddHeader([string] $Name, [string] $Value) { $This.AddHeader([PSWebServerHeader]::New($Name, $Value)) }
 	[void]  RemoveHeader([PSWebServerHeader] $Header) { $This.Headers = $This.Headers.GetHeaders().Where{ $_.Name -eq $Header.Name } }
 	[void]  RemoveHeader([string] $Name) { $This.Headers = $This.Headers.GetHeaders().Where{ $_.Name -eq $Name } }
 
@@ -280,14 +284,34 @@ class PSWebServerResponse : PSWebServerRequestResponseBase {
 	[int32] GetStatusCode() { return $This.StatusCode }
 	[void]  SetStatusCode([int32] $StatusCode) { $This.StatusCode = $StatusCode }
 	
+	[System.Net.WebHeaderCollection] ConvertHeadersToHeaderCollection () {
+		$headerCollection = [System.Net.WebHeaderCollection]::new()
+		
+		foreach ($header in $this.Headers){
+			$headerCollection.add($header.name, $header.value)
+		}
+		
+		return $HeaderCollection
+	}
+	
 	[void] Close () {
 		$this.Context.Response.Close()
 	}
 
 	[void] Write() {
+		$This.Context.Response
+
+		$RestrictedHeaders = @("Content-Type")
+		$This.Context.Response.Headers.Add($this.ConvertHeadersToHeaderCollection())
+		$this.Headers.Where{$_.Name -in $RestrictedHeaders}.Foreach{
+			if ($_.Name -eq "Content-Type") { $This.Context.Response.ContentType = $_.Value }
+		}
+		write-host $(ConvertTo-Json -InputObject $this.Context.Response.Headers)
 		$buffer = [Text.Encoding]::UTF8.GetBytes($this.Body)
+		$This.Context.Response.SendChunked = $true
 		$This.Context.Response.ContentLength64 = $buffer.length
 		$This.Context.Response.OutputStream.Write($buffer, 0, $buffer.length)
+		$This.Context.Response.OutputStream.Close()
 	}
 
 	[void] WriteAndClose() {
@@ -342,6 +366,21 @@ class Controller {
 			}
 		}
 		return $Hashtable
+	}
+	
+	[string[]] GetServiceParamsFromScriptBlock() {
+		[string[]] $returnList = @()
+		
+		foreach ($ParamKV in $this.GetParamsFromScriptBlock().GetEnumerator()) {
+			$ParamName = $ParamKV.Name
+			$ParamType = $ParamKV.Value
+
+			if ($ParamType -eq "FromService") {
+				$returnList += $ParamName
+			}
+		} 
+
+		return $ReturnList
 	}
 
 	[string[]] GetRouteParamsFromScriptBlock() {
@@ -399,6 +438,14 @@ class Controller {
 			}
 		}
 	
+		
+		foreach ($FromServiceParamName in $this.GetServiceParamsFromScriptBlock()) {
+			if ($ServiceParams.ContainsKey($FromServiceParamName)) {
+				$Params.Add($FromServiceParamName, [System.Web.HttpUtility]::UrlDecode($ServiceParams[$FromServiceParamName]))
+			}
+		}
+	
+
 		$Result = & $this.ScriptBlock @Params
 
 		return $result
